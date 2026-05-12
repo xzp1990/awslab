@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-cache-stress
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: s3-cache-stress
+  template:
+    metadata:
+      labels:
+        app: s3-cache-stress
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.g5.8xlarge
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: app
+          image: amazonlinux:2023
+          command: ["sleep", "infinity"]
+          volumeMounts:
+            - name: s3-vol
+              mountPath: /data/s3
+      volumes:
+        - name: s3-vol
+          persistentVolumeClaim:
+            claimName: s3-pvc-cached

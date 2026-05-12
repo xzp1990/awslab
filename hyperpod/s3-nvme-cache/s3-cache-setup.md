@@ -372,6 +372,72 @@ echo "Total: ${elapsed}ms, Throughput: $(( 20 * 1024 * 1000 / elapsed )) MB/s"
 - g6e.xlarge（2 vCPU）受 CPU 限制，FUSE 开销大，吞吐受限
 - **CPU 核数是影响缓存吞吐的关键因素**，建议使用 8+ vCPU 的实例
 
+## 多 Pod 共享同一 PVC
+
+`s3-pvc-cached` 的 accessMode 为 `ReadWriteMany`，支持同一节点上多个 Pod 同时挂载。所有 Pod 共享同一个 Mountpoint Pod（FUSE 进程），不会重复创建。
+
+### 测试结果（g5.8xlarge，同节点多 Pod 同时热读 20GB）
+
+| 场景 | 每 Pod 吞吐 | 合计吞吐 |
+|------|-----------|---------|
+| 单 Pod 热读 | 1.1~1.2 GB/s | 1.2 GB/s |
+| 两 Pod 同时热读 | 571~586 MB/s | ~1.17 GB/s |
+
+合计吞吐基本不变，带宽被多个 Pod 平分。原因是所有 Pod 共享同一个 Mountpoint FUSE 进程，总带宽受限于该进程的吞吐上限。
+
+> 如果需要多 Pod 各自跑满带宽，需创建多个独立的 S3 PV/PVC（不同 `volumeHandle`），每个 PVC 会有自己的 Mountpoint Pod。但会受到单节点只有一个 NVMe PV 的缓存限制（见注意事项第 7 条）。
+
+## 已知问题：FailedMount（mountpoint pod not found）
+
+### 错误现象
+
+```
+FailedMount: MountVolume.SetUp failed for volume "xxx" : rpc error: code = Internal desc =
+Could not mount "bucket" at "...": Failed to wait for Mountpoint Pod "mp-xxxxx" to be ready:
+mppod/watcher: mountpoint pod not found.
+```
+
+### 触发条件
+
+通过压力测试（5 replicas 反复 scale 0→5 + 强制删除 Mountpoint Pod）成功复现。以下场景会触发：
+
+1. **NVMe PV 不可用**（Released 状态未清理、指向已下线节点）→ Mountpoint Pod 的 cache PVC Pending → Mountpoint Pod 无法启动
+2. **Mountpoint Pod 被意外删除或驱逐** → 正在等待挂载的工作负载 Pod 立即报错
+3. **DNS 暂时性故障** → Mountpoint Pod 启动失败（`AWS_IO_DNS_QUERY_FAILED`）
+4. **节点 Pod 数量达到上限** → Mountpoint Pod 无法调度
+
+### 影响
+
+- 这是**暂时性错误**，kubelet 会自动重试挂载（默认每 ~2 分钟）
+- S3 CSI controller 会自动重新创建 Mountpoint Pod
+- 压力测试中所有 Pod 最终都恢复到 Running 状态
+
+### 排查步骤
+
+```bash
+# 1. 查看 Mountpoint Pod 状态
+kubectl get pods -n mount-s3 -o wide
+kubectl describe pods -n mount-s3
+
+# 2. 查看 cache PVC 是否绑定
+kubectl get pvc -n mount-s3
+
+# 3. 查看 NVMe PV 状态（是否有 Released 未清理的）
+kubectl get pv | grep nvme-local
+
+# 4. 查看 FailedMount 事件
+kubectl get events --field-selector reason=FailedMount --sort-by='.lastTimestamp'
+
+# 5. 清理 Released 状态的 PV（provisioner 会自动重建）
+kubectl get pv -o name | while read pv; do
+  status=$(kubectl get $pv -o jsonpath='{.status.phase}')
+  sc=$(kubectl get $pv -o jsonpath='{.spec.storageClassName}')
+  if [ "$status" = "Released" ] && [ "$sc" = "nvme-local" ]; then
+    kubectl delete $pv
+  fi
+done
+```
+
 ## 注意事项
 
 1. **Provisioner 发现机制**：`hostDir` 设为 `/opt/dlami`（父目录），provisioner 发现其下的 `nvme` **挂载点**。普通子目录不会被发现，必须是独立 mount point
