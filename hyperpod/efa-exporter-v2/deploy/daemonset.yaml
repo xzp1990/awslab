@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: efa-exporter
+  namespace: default
+  labels:
+    app: efa-exporter
+spec:
+  selector:
+    matchLabels:
+      app: efa-exporter
+  template:
+    metadata:
+      labels:
+        app: efa-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9119"
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - ml.g6e.8xlarge
+                      - ml.p5en.48xlarge
+                      - ml.p5e.48xlarge
+                      - ml.p6-b300.48xlarge
+                      - ml.p5.48xlarge
+      containers:
+        - name: efa-exporter
+          image: 970662323538.dkr.ecr.ap-southeast-3.amazonaws.com/hyperpod/efa_exporter:2.0.0
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --web.listen-address=0.0.0.0:9119
+            - --collector.disable-defaults
+            - --collector.amazonefa
+          ports:
+            - containerPort: 9119
+              name: metrics
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
