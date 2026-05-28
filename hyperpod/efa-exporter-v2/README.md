@@ -40,12 +40,172 @@ node_amazonefa_tx_bytes{device="rdmap47s0",port="1",pod="nccl-test-g6e-worker-0"
 
 ## Changes from Upstream
 
-Only `amazon_efa_linux.go` is modified:
+Only `amazon_efa_linux.go` is modified. `class_amazon_efa.go` (sysfs parser) and `Dockerfile` build flow remain unchanged except for adding Go dependencies.
 
-1. Added PodResources gRPC client (background goroutine, 15s poll interval)
-2. Queries `vpc.amazonaws.com/efa` device assignments from kubelet
-3. Extended metric labels from `[device, port]` to `[device, port, pod, namespace, container]`
-4. When no Pod uses the device, labels are empty strings
+### Modified File: `amazon_efa_linux.go`
+
+The original file belongs to `package collector` in prometheus/node_exporter. It registers an `amazonefa` collector that reads EFA hardware counters from sysfs and exposes them as Prometheus metrics with labels `[device, port]`.
+
+#### 1. New imports and constants
+
+```go
+import (
+    // ... existing imports ...
+    "context"
+    "net"
+    "sync"
+    "time"
+
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+    podresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+)
+
+const (
+    efaResource       = "vpc.amazonaws.com/efa"
+    kubeletSocketPath = "/var/lib/kubelet/pod-resources/kubelet.sock"
+    podPollInterval   = 15 * time.Second
+)
+```
+
+#### 2. Pod mapping data structure and background poller
+
+A global map `podDevMap` stores the mapping from EFA device name (e.g., `rdmap47s0`) to the Pod that owns it. A singleton goroutine (`sync.Once`) refreshes this map every 15 seconds.
+
+```go
+type podInfo struct {
+    Pod       string
+    Namespace string
+    Container string
+}
+
+var (
+    podMapMu   sync.RWMutex
+    podDevMap  = map[string]podInfo{} // device_id -> podInfo
+    podMapOnce sync.Once
+)
+
+func startPodMapper(logger *slog.Logger) {
+    podMapOnce.Do(func() {
+        go func() {
+            for {
+                m := fetchPodResources(logger)
+                podMapMu.Lock()
+                podDevMap = m
+                podMapMu.Unlock()
+                time.Sleep(podPollInterval)
+            }
+        }()
+    })
+}
+```
+
+#### 3. PodResources gRPC query (`fetchPodResources`)
+
+Connects to the kubelet PodResources gRPC socket (same mechanism DCGM exporter uses with `-k` flag), lists all pod resource allocations, and filters for `vpc.amazonaws.com/efa` devices:
+
+```go
+func fetchPodResources(logger *slog.Logger) map[string]podInfo {
+    result := map[string]podInfo{}
+    // Connect to unix:///var/lib/kubelet/pod-resources/kubelet.sock
+    conn, err := grpc.DialContext(ctx, "unix://"+socketPath, ...)
+    client := podresourcesv1.NewPodResourcesListerClient(conn)
+    resp, err := client.List(ctx, &podresourcesv1.ListPodResourcesRequest{})
+
+    for _, pod := range resp.GetPodResources() {
+        for _, container := range pod.GetContainers() {
+            for _, dev := range container.GetDevices() {
+                if dev.GetResourceName() == "vpc.amazonaws.com/efa" {
+                    for _, id := range dev.GetDeviceIds() {
+                        // id is the EFA device name (e.g., "rdmap47s0")
+                        result[id] = podInfo{
+                            Pod:       pod.GetName(),
+                            Namespace: pod.GetNamespace(),
+                            Container: container.GetName(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return result
+}
+```
+
+The key insight: when a Pod requests `vpc.amazonaws.com/efa: 1` in its resource limits, the EFA device plugin assigns a specific device (e.g., `rdmap47s0`) to that Pod. The kubelet records this assignment and exposes it via the PodResources API. The device ID returned matches the device name in `/sys/class/infiniband/`, which is exactly what the EFA collector iterates over.
+
+#### 4. Extended metric descriptors
+
+Original labels were `["device", "port"]`. Now extended to include pod info:
+
+```go
+// Before (V1):
+prometheus.NewDesc(..., []string{"device", "port"}, nil)
+
+// After (V2):
+prometheus.NewDesc(..., []string{"device", "port", "pod", "namespace", "container"}, nil)
+```
+
+#### 5. Modified `pushMetric` to inject pod labels
+
+When emitting a metric, look up the device in the pod map and inject labels:
+
+```go
+func (c *AmazonEfaCollector) pushMetric(ch chan<- prometheus.Metric, name string, value uint64, deviceName string, port string, valueType prometheus.ValueType) {
+    podMapMu.RLock()
+    info, hasPod := podDevMap[deviceName]
+    podMapMu.RUnlock()
+
+    pod, ns, container := "", "", ""
+    if hasPod {
+        pod = info.Pod
+        ns = info.Namespace
+        container = info.Container
+    }
+
+    ch <- prometheus.MustNewConstMetric(c.metricDescs[name], valueType, float64(value),
+        deviceName, port, pod, ns, container)
+}
+```
+
+#### 6. Collector initialization starts the pod mapper
+
+```go
+func NewAmazonEfaCollector(logger *slog.Logger) (Collector, error) {
+    // ... existing init code ...
+    startPodMapper(logger)  // <-- new: start background pod mapping
+    return &i, nil
+}
+```
+
+### Modified File: `Dockerfile`
+
+Added two `go get` commands to pull in the PodResources API dependencies:
+
+```dockerfile
+# Add PodResources API dependencies
+RUN go get k8s.io/kubelet@v0.30.2
+RUN go get google.golang.org/grpc@v1.65.0
+```
+
+### Data Flow Summary
+
+```
+1. kubelet assigns EFA device "rdmap47s0" to Pod "training-worker-0"
+   (via vpc.amazonaws.com/efa device plugin)
+
+2. EFA Exporter background goroutine (every 15s):
+   gRPC → kubelet:///var/lib/kubelet/pod-resources/kubelet.sock
+   → ListPodResources()
+   → filters resource_name == "vpc.amazonaws.com/efa"
+   → builds map: {"rdmap47s0" → {pod:"training-worker-0", ns:"default", container:"nccl"}}
+
+3. On /metrics scrape:
+   → reads /sys/class/infiniband/rdmap47s0/ports/1/hw_counters/*
+   → looks up "rdmap47s0" in pod map
+   → emits: node_amazonefa_tx_bytes{device="rdmap47s0",port="1",
+             pod="training-worker-0",namespace="default",container="nccl"} 12345
+```
 
 ## Validation
 
