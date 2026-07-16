@@ -7,6 +7,7 @@ SageMaker HyperPod EKS 集群中，每个实例只支持 1 个 ENI。不同实�
 | 实例类型 | 每 ENI IPv4 数 | 默认 maxPods | Prefix Delegation 后 maxPods |
 |---------|---------------|-------------|------------------------------|
 | ml.g6e.xlarge | 15 | 14 | 58 |
+| ml.g5.xlarge | 15 | 14 | 58 |
 | ml.g4dn.xlarge | 10 | 9 | 58（理论最大 110+） |
 
 当集群系统组件较多时，默认的 maxPods 不够用，会导致大量 pod 处于 Pending 状态。
@@ -251,16 +252,33 @@ systemd path unit 的 `PathExists` 指令会监听文件系统，当目标文件
 |------|--------|--------|
 | allocatable pods | 9 | 58 |
 | 系统组件 pod | 受限于 9（大量 Pending） | 11（全部 Running） |
-| 测试 nginx pod | — | 15（全部 Running） |
-| 节点总 pod 数 | 最多 9 | 实测 26（仍有余量到 58） |
+| 测试 nginx pod | — | 47（全部 Running） |
+| 节点总 pod 数 | 最多 9 | 实测 **58（满载，全部 Running）** |
+| 第 59 个 pod | — | Pending（`Too many pods`）✅ |
 
 **操作步骤**：
 1. 通过 EKS addon API 开启 Prefix Delegation
 2. 在现有 `on_create.sh` wrapper 末尾追加 maxPods patch（systemd path unit）
 3. Scale down 节点组到 0，再 scale up 到 1
-4. 节点启动后自动应用 maxPods=58，15 个 nginx 测试 pod 全部 Running
+4. 节点启动后自动应用 maxPods=58，58 个 pod 全部 Running
 
 **注意**：g4dn.xlarge 在 prefix delegation 模式下理论最大可支持 110+ pods（9 个 /28 前缀 × 16 IP = 144），但 58 已满足需求，且减少子网 IP 消耗。
+
+### 测试 3：ml.g5.xlarge（us-west-2）
+
+在同一集群上新增 `g5-xlarge` 实例组，使用相同的 `on_create.sh` + `on_create_main.sh`。
+
+**实测结果**：
+
+| 指标 | 修改前 | 修改后 |
+|------|--------|--------|
+| allocatable pods | 默认受限 | 58 |
+| 系统组件 pod | — | 5（全部 Running） |
+| 测试 nginx pod | — | 53（全部 Running） |
+| 节点总 pod 数 | — | 实测 **58（满载，全部 Running）** |
+| 第 59 个 pod | — | Pending（`Too many pods`）✅ |
+
+g5.xlarge 与 g4dn.xlarge 使用完全相同的方案，无需任何调整。
 
 ## 适用于已有 on_create_main.sh 的集群
 
