@@ -16,7 +16,7 @@ aws eks update-addon \
   --addon-name vpc-cni \
   --region "$REGION" \
   --resolve-conflicts OVERWRITE \
-  --configuration-values '{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"2","WARM_IP_TARGET":"5","MINIMUM_IP_TARGET":"30"}}'
+  --configuration-values '{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"1","WARM_IP_TARGET":"3","MINIMUM_IP_TARGET":"15"}}'
 
 echo "Waiting for addon update..."
 aws eks wait addon-active \

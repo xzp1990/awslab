@@ -2,9 +2,14 @@
 
 ## 背景
 
-SageMaker HyperPod EKS 集群中，每个实例只支持 1 个 ENI。对于 `ml.g6e.xlarge`，默认 maxPods 为 **14**（单 ENI 最多 15 个 IPv4 地址 - 1 个主 IP = 14）。
+SageMaker HyperPod EKS 集群中，每个实例只支持 1 个 ENI。不同实例类型的默认 maxPods 不同：
 
-当集群系统组件较多时，14 个 pod 不够用，会导致大量 pod 处于 Pending 状态。
+| 实例类型 | 每 ENI IPv4 数 | 默认 maxPods | Prefix Delegation 后 maxPods |
+|---------|---------------|-------------|------------------------------|
+| ml.g6e.xlarge | 15 | 14 | 58 |
+| ml.g4dn.xlarge | 10 | 9 | 58（理论最大 110+） |
+
+当集群系统组件较多时，默认的 maxPods 不够用，会导致大量 pod 处于 Pending 状态。
 
 ## 解决方案
 
@@ -37,6 +42,17 @@ aws eks update-addon \
   --resolve-conflicts OVERWRITE \
   --configuration-values '{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"2","WARM_IP_TARGET":"5","MINIMUM_IP_TARGET":"30"}}'
 ```
+
+如果不想预热太多 IP（减少子网 IP 消耗），可以使用保守配置：
+
+```bash
+--configuration-values '{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"1","WARM_IP_TARGET":"3","MINIMUM_IP_TARGET":"15"}}'
+```
+
+参数说明：
+- `WARM_PREFIX_TARGET`：预热的 /28 前缀数量（每个前缀 16 个 IP）
+- `WARM_IP_TARGET`：保持多少个空闲 IP 随时可分配
+- `MINIMUM_IP_TARGET`：节点上最少预分配的 IP 数
 
 或使用提供的脚本：
 
@@ -197,11 +213,148 @@ systemd path unit 的 `PathExists` 指令会监听文件系统，当目标文件
 ## 文件说明
 
 ```
-├── README.md                      # 本文档
-├── on_create.sh                   # lifecycle script（上传到 S3）
-└── enable-prefix-delegation.sh    # 一键开启 VPC CNI prefix delegation（集群级别）
+├── README.md                        # 本文档
+├── on_create.sh                     # v1: 单文件版 lifecycle script（containerd + maxPods patch）
+├── enable-prefix-delegation.sh      # 一键开启 VPC CNI prefix delegation（集群级别）
+└── v2-wrapper-mode/                 # v2: 两文件版（适用于 HyperPod 新版默认模板）
+    ├── on_create.sh                 # wrapper + maxPods patch
+    └── on_create_main.sh            # containerd/kubelet 迁移 + EFA/FSx 配置
 ```
+
+- **v1（根目录 `on_create.sh`）**：所有逻辑写在一个文件中，适合简单场景
+- **v2（`v2-wrapper-mode/`）**：拆分为 wrapper + main，适合已有 `on_create_main.sh` 的集群（HyperPod 新版默认模板）。将两个文件一起上传到 S3 的 `SourceS3Uri` 即可
 
 ## 测试总结
 
+### 测试 1：ml.g6e.xlarge（ap-southeast-3）
+
 在 ap-southeast-3 区域的 HyperPod EKS 集群上，使用 `ml.g6e.xlarge` 单节点完成验证。通过开启 VPC CNI Prefix Delegation 并修改 kubelet maxPods，节点可调度 pod 数从 14 提升至 58。实测部署 58 个 pod（32 个系统组件 + 26 个 nginx）全部 Running，第 59 个 pod 被调度器拒绝（`Too many pods`），确认限制生效。新节点启动后 maxPods 通过 systemd path unit 自动修改，无需人工干预。
+
+### 测试 2：ml.g4dn.xlarge（us-west-2）
+
+在 us-west-2 区域的 HyperPod EKS 集群（`dcc`，`arn:aws:sagemaker:us-west-2:970662323538:cluster/o37l5kyzu6i3`）上，使用 `ml.g4dn.xlarge` 单节点完成验证。
+
+**集群配置**：
+- EKS 集群：`sagemaker-dcc-fb2b67fe-eks`
+- 实例类型：ml.g4dn.xlarge（3 ENI，10 IP/ENI，HyperPod 限制 1 ENI）
+- 原始 maxPods：9（1 ENI × 10 IP - 1 主 IP = 9）
+- Lifecycle 脚本结构：`on_create.sh`（wrapper）+ `on_create_main.sh`（containerd/kubelet/EFA 配置）
+
+**VPC CNI 配置（保守 prewarm）**：
+```json
+{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"1","WARM_IP_TARGET":"3","MINIMUM_IP_TARGET":"15"}}
+```
+
+**实测结果**：
+
+| 指标 | 修改前 | 修改后 |
+|------|--------|--------|
+| allocatable pods | 9 | 58 |
+| 系统组件 pod | 受限于 9（大量 Pending） | 11（全部 Running） |
+| 测试 nginx pod | — | 15（全部 Running） |
+| 节点总 pod 数 | 最多 9 | 实测 26（仍有余量到 58） |
+
+**操作步骤**：
+1. 通过 EKS addon API 开启 Prefix Delegation
+2. 在现有 `on_create.sh` wrapper 末尾追加 maxPods patch（systemd path unit）
+3. Scale down 节点组到 0，再 scale up 到 1
+4. 节点启动后自动应用 maxPods=58，15 个 nginx 测试 pod 全部 Running
+
+**注意**：g4dn.xlarge 在 prefix delegation 模式下理论最大可支持 110+ pods（9 个 /28 前缀 × 16 IP = 144），但 58 已满足需求，且减少子网 IP 消耗。
+
+## 适用于已有 on_create_main.sh 的集群
+
+如果集群已经使用了 `on_create.sh` + `on_create_main.sh` 两文件结构（如 HyperPod 新版默认模板），只需在 `on_create.sh` 的 `logger "[stop] on_create.sh"` 之前追加 maxPods patch 代码块即可，不需要修改 `on_create_main.sh`。
+
+示例 `on_create.sh`（wrapper + maxPods patch）：
+
+```bash
+#!/bin/bash
+set -ex
+
+LOG_FILE="/var/log/provision/provisioning.log"
+mkdir -p "/var/log/provision"
+touch "$LOG_FILE"
+
+logger() {
+  echo "$@" | tee -a "$LOG_FILE"
+}
+
+logger "[start] on_create.sh"
+
+if [ -f "./on_create_main.sh" ]; then
+  if ! bash ./on_create_main.sh >> "$LOG_FILE" 2>&1; then
+    logger "[error] on_create_main.sh failed"
+    sync && sleep 60
+    exit 1
+  fi
+else
+  logger "[warning] on_create_main.sh not found, skipping"
+fi
+
+######################################################################
+# Patch maxPods (追加部分 - 与本 repo 的 on_create.sh 中 patch 逻辑相同)
+######################################################################
+TARGET_MAX_PODS=58
+
+cat << 'PATCHSCRIPT' > /opt/sagemaker/patch-maxpods.sh
+#!/bin/bash
+LOG="/var/log/provision/patch-maxpods.log"
+KUBELET_OVERRIDE="/etc/kubernetes/kubelet/config.json.d/40-nodeadm.conf"
+TARGET_MAX_PODS=58
+
+if [[ ! -f "$KUBELET_OVERRIDE" ]]; then
+  echo "[$(date)] ERROR: $KUBELET_OVERRIDE not found" >> "$LOG"
+  exit 1
+fi
+
+CURRENT=$(python3 -c "import json; print(json.load(open('$KUBELET_OVERRIDE'))['maxPods'])")
+echo "[$(date)] Current maxPods: $CURRENT" >> "$LOG"
+
+if [[ "$CURRENT" -ne "$TARGET_MAX_PODS" ]]; then
+  python3 -c "
+import json
+f = '$KUBELET_OVERRIDE'
+c = json.load(open(f))
+c['maxPods'] = $TARGET_MAX_PODS
+json.dump(c, open(f, 'w'), indent=4)
+"
+  echo "[$(date)] Updated maxPods to $TARGET_MAX_PODS, restarting kubelet..." >> "$LOG"
+  systemctl restart kubelet
+  echo "[$(date)] kubelet restarted" >> "$LOG"
+else
+  echo "[$(date)] maxPods already $TARGET_MAX_PODS, no change needed" >> "$LOG"
+fi
+
+systemctl disable patch-maxpods.path 2>/dev/null
+systemctl stop patch-maxpods.path 2>/dev/null
+echo "[$(date)] patch-maxpods.path disabled" >> "$LOG"
+PATCHSCRIPT
+chmod +x /opt/sagemaker/patch-maxpods.sh
+
+cat <<EOF > /etc/systemd/system/patch-maxpods.path
+[Unit]
+Description=Watch for kubelet config to patch maxPods
+[Path]
+PathExists=/etc/kubernetes/kubelet/config.json.d/40-nodeadm.conf
+Unit=patch-maxpods.service
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat <<EOF > /etc/systemd/system/patch-maxpods.service
+[Unit]
+Description=Patch kubelet maxPods after nodeadm
+After=kubelet.service
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=/opt/sagemaker/patch-maxpods.sh
+EOF
+
+systemctl daemon-reload
+systemctl enable --now patch-maxpods.path
+logger "[maxpods] Enabled systemd path watcher (target: $TARGET_MAX_PODS)"
+
+logger "[stop] on_create.sh"
+```
